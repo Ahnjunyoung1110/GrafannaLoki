@@ -1,0 +1,1065 @@
+# ============================================================
+# Vector config with detailed comments for Sources / Transforms / Sinks
+# - 주석은 모두 `#`만 사용 (복붙 실행 가능)
+# - 코드/키 이름은 원본 그대로 유지 (오타도 수정 안함)
+# ============================================================
+
+sources:
+  # =====================================
+  # 📂 SOURCES: sqs 기반 로그 수집
+  # =====================================
+  s3_logs:
+    type: aws_s3
+    region: ap-northeast-2
+    auth:
+      access_key_id: "${AWS_ACCESS_KEY_ID}"
+      secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
+    sqs:
+      queue_url: "https://sqs.ap-northeast-2.amazonaws.com/971476708384/free_plz_i_dont_have_money"
+      visibility_timeout_secs: 300
+    compression: auto
+    
+
+# =====================================
+# 🔄 TRANSFORMS: 로그 파싱 및 구조화
+# - VRL 주석(#)만 사용, 로직/키 그대로 유지
+# =====================================
+transforms:
+  # ---------------------------------------------------------
+  # S3 오브젝트 메타데이터 기반 분기
+  # - object 기준으로 CloudFront / TencentCDN / ADS/ LIVE 구분
+  # ---------------------------------------------------------
+  s3_parsing:
+    type: remap
+    inputs: [s3_logs]
+    source: |
+      .bucket = to_string!(.bucket)
+      .object    = to_string!(.object)
+      .region = to_string!(.region)
+
+
+      if contains(.object, "ads.its-newid.net") {
+        .service = "ads"
+        # 4개 호스트 구분자 부여
+        if contains(.object, "10.0.0.25") {
+          .host_id = "ads-10-25"
+        } else if contains(.object, "10.0.0.26") {
+          .host_id = "ads-10-26"
+        } else if contains(.object, "10.0.10.25") {
+          .host_id = "ads-10-25"
+        } else if contains(.object, "10.0.10.26") {
+          .host_id = "ads-10-26"
+        } else {
+          .host_id = "ads-unknown"
+        }
+      } else if contains(.object, "live.its-newid.net") {
+        .service = "live"
+        # 4개 호스트 구분자 부여
+        if contains(.object, "10.0.0.101") {
+          .host_id = "live-0-101"
+        } else if contains(.object, "10.0.0.102") {
+          .host_id = "live-0-102"
+        } else if contains(.object, "10.0.10.101") {
+          .host_id = "live-0-101"
+        } else if contains(.object, "10.0.10.102") {
+          .host_id = "live-0-102"
+        } else {
+          .host_id = "live-unknown"
+        }
+      } else if contains(.object, "cloudfront") {
+        .service = "cloudfront"
+        .host_id = "cloudfront"
+      } else if contains(.object, "cdn44") {
+        .service = "tencentcdn"
+        .host_id = "tencentcdn"
+      } else {
+        .service = "unknown"
+        .host_id = "unknown"
+      }
+  # ---------------------------------------------------------
+  # 위에서 설정된 service 기준으로 분기
+  # - CloudFront → CloudFront_cdn
+  # - TencentCDN → Tencent_cdn
+  # - ads → Ads
+  # - live → Live
+  # ---------------------------------------------------------
+
+  route_by_service:
+    type: exclusive_route
+    inputs: [s3_parsing]
+    routes:
+      - name: CloudFront_cdn
+        condition: .service == "cloudfront"
+      - name: Tencent_cdn
+        condition: .service == "tencentcdn"
+      - name: Ads
+        condition: .service == "ads"
+      - name: Live
+        condition: .service == "live"
+      - name: Unknown
+        condition: .service == "unknown"
+
+  # ---------------------------------------------------------
+  # CloudFront 로그 파싱
+  # - 탭 분리 포맷, 필드 수 검증, 타임스탬프 변환
+  # - channel_id → 50단위 bucket 그룹핑 (rt 접두사 구분)
+  # ---------------------------------------------------------
+  CloudFront_cdn:
+    type: remap
+    inputs:
+      - route_by_service.CloudFront_cdn
+    source: |
+      # BOM 제거
+      .message = replace!(.message, r'^\uFEFF', "")
+
+      # 탭 구분자로 필드 분리
+      fields = split(to_string(.message), "\t")
+      if length(fields) < 30 { 
+         if .message == "#Version: 1.0" {
+            log("CloudFront CDN 로그 헤더 발견, 무시합니다")
+            del(.message)  # 헤더는 삭제
+            abort         # 파싱 중단 
+          }
+         if match(to_string!(.message), r'^\s*#(?:Fields|Version|Software):') {
+            log("CloudFront 헤더/주석 라인 드롭: " + to_string!(.message))
+            abort
+          }
+
+        log("❌ 필드 수 부족. drop합니다: " + to_string(length(fields)), level: "error")
+        log("필드 내용: " + to_string!(.message), level: "error")
+        abort
+      }
+      raw_time = to_string(fields[0])     # "2025-07-15"
+      raw_clock = to_string(fields[1])    # "00:36:25"
+      timestamp_str = raw_time + " " + raw_clock
+      .origin_time = parse_timestamp!(timestamp_str, format: "%Y-%m-%d %H:%M:%S")
+
+      # 필드 매핑
+      .edge_location = fields[2]
+      .bytes_sent    = to_int!(fields[3])
+      .client_ip     = fields[4]
+      .method        = fields[5]
+      .host          = fields[6]
+      .uri_stem      = fields[7]
+      .status_code   = fields[8]
+      .referer       = fields[9]
+      .user_agent    = fields[10]
+      .uri_query     = fields[11]
+      .cookie        = fields[12]
+      .cache_hit   = fields[13]
+      .request_id    = fields[14]
+      .cdn_host   = fields[15]
+      .protocol      = fields[16]
+      .cs_bytes      = to_int!(fields[17])
+      .time_taken    = to_float!(fields[18])
+      .xff           = fields[19]
+      .ssl_protocol  = fields[20]
+      .ssl_cipher    = fields[21]
+      .resp_result   = fields[22]
+      .http_version  = fields[23]
+      .fle_status    = fields[24]
+      .fle_fields    = fields[25]
+      .client_port   = fields[26]
+      .ttfb          = to_float!(fields[27])
+      .detailed_type = fields[28]
+      .content_type  = fields[29]
+
+      # 쿼리 파라미터 파싱
+      request_param = parse_url!(join!(["ftp://foo@example.com:4343?", .uri_query]))
+      .resolution       = request_param.query.resolution
+      .target_platform  = request_param.query.target_platform
+      if exists(request_param.query.program_id) {
+        .program_id = request_param.query.program_id
+      } else {
+        .program_id = request_param.query.programId
+      }
+      .channel_id       = request_param.query.channel_id
+
+      # 채널 그룹핑 (50단위 버킷) - newid_ / newid_rt_ 형태 지원
+      .channel_group = "default_group"
+      if !is_nullish(.channel_id) {
+        m, err = parse_regex(.channel_id, r'^newid_(?P<prefix>rt)?(?P<num>\d{1,4})(?:_.*)?$')
+        if err == null {
+          num      = to_int!(m.num)
+          bucket   = to_string(floor(num / 50))
+          if m.prefix == "rt" {
+            .channel_group ="grp_rt_" + bucket
+          } else {
+            .channel_group = "grp_" + bucket
+          } 
+        } else {
+          log("Regex parsing error: " + to_string(err) + " ch=" + to_string(.channel_id))
+        }
+      }
+
+      del(.message)
+      log("CloudFront CDN 로그 파싱 완료: " + to_string(.origin_time))
+
+      .timestamp = .origin_time
+
+  # ---------------------------------------------------------
+  # Tencent CDN 로그 파싱
+  # - 라인에서 User-Agent를 먼저 분리 → 나머지 공백 분리
+  # - URI 쿼리 파싱, channel_id 그룹핑
+  # ---------------------------------------------------------
+  Tencent_cdn:
+    type: remap
+    inputs: 
+      - route_by_service.Tencent_cdn
+    source: |
+      # User-Agent 추출 (따옴표 내부)
+      .user_agent = values(parse_regex!(.message, r'"(?P<ua>[^"]+)"'))[0]
+      
+      # BOM 제거
+      .message = replace!(.message, r'^\uFEFF', "")
+
+      # User-Agent 제거 후 공백 분리
+      log(.user_agent)
+      cleaned_word = replace(.message, " \"" + .user_agent + "\"", "", count: 1)
+      assert!(cleaned_word != null, message: "cleaned_word 필드가 null입니다")
+      log("cleaned_word: " + string(cleaned_word))
+      fields = split(string(cleaned_word), " ")
+      log("fields: " + join!(fields))
+      if length(fields) < 15 {
+        log("❌ 필드 수 부족. drop합니다: ")
+        abort
+      }
+
+      # 필드 매핑
+      .origin_time = parse_timestamp!(fields[0], format: "%Y%m%d%H%M%S")
+      .client_ip      = fields[1]
+      .cdn_host       = fields[2]
+      .request_uri    = fields[3]
+      .response_bytes = to_int!(fields[4])
+      .region         = fields[5]
+      .carrier        = fields[6]
+      .status_code    = fields[7]
+      .referer        = fields[8]
+      .resp_time      = to_int!(fields[9])
+      .range_param    = fields[10]
+      .method         = fields[11]
+      .protocol       = fields[12]
+      .cache_hit      = fields[13]
+      .pop_id         = fields[14]
+
+      # URI 쿼리 파싱
+      request_param = parse_url!(join!(["ftp://foo@example.com:4343", .request_uri]))
+      .path_uri          = to_string(request_param.path)
+      .resolution       = request_param.query.resolution
+      .target_platform  = request_param.query.target_platform
+      if exists(request_param.query.program_id) {
+        .program_id = request_param.query.program_id
+      } else {
+        .program_id = request_param.query.programId
+      }
+      .channel_id       = request_param.query.channel_id
+
+      # 채널 그룹핑 (50단위 버킷)
+      .channel_group = "default_group"
+      if !is_nullish(.channel_id) {
+        m, err = parse_regex(.channel_id, r'^newid_(?P<prefix>rt)?(?P<num>\d{1,4})(?:_.*)?$')
+        if err == null {
+          num      = to_int!(m.num)
+          bucket   = to_string(floor(num / 50))
+          if m.prefix == "rt" {
+            .channel_group ="grp_rt_" + bucket
+          } else {
+            .channel_group = "grp_" + bucket
+          } 
+        } else {
+          log("Regex parsing error: " + to_string(err) + " ch=" + to_string(.channel_id))
+        }
+      }
+
+      # 일부 이벤트에서 cache_hit 없음 → 기본값 보정
+      log("완료")
+      if !exists(.cache_hit){
+      .cache_hit = "null" }
+      del(.message)
+
+      .timestamp = .origin_time
+
+  # ---------------------------------------------------------
+  # ADS 파서 (Apache 로그 포맷 + duration 확장)
+  # - 4개 입력(0/10 x 25/26) 각각 별도 호스트 식별자 부여
+  # - XFF, 필드 형변환, URL 파싱, 채널 그룹핑, ads.* 파라미터 추출
+  # ---------------------------------------------------------
+
+  Ads:
+    type: remap
+    inputs: [route_by_service.Ads]
+    source: |
+      # 시작 로그
+      log("ads 로그 시작")
+
+      # NUL 문자 제거 (tar 전개 등으로 섞이는 아티팩트 방지)
+      .message, err = replace(.message, "\0", "")
+      if err != null {
+        log("Error replacing null characters: " + to_string(err))
+        .message = ""
+      }
+
+      # tar 헤더 흔적 문자열 제거 (라인은 유지)
+      if contains(.message, "ustar") {
+          .message = replace(.message, "ustar", "")
+      }
+      if contains(.message, "root") {
+          .message = replace(.message, "root", "")
+      }
+
+      # Apache combined + duration 확장 포맷 파싱
+      this_is_a_test, err = parse_regex( .message, r'^(?P<xff>[^ ]+(?:, ?[^ ]+)*) (?P<remote_host>[^ ]+) (?P<identd>[^ ]+) (?P<user>[^ ]+) \[(?P<timestamp>[^\]]+)\] "(?P<method>[A-Z]+) (?P<uri>[^ ]+) (?P<protocol>[^"]+)" (?P<status>\d{3}) (?P<bytes>[^ ]+) (?P<duration>[^ ]+) "(?P<referer>[^"]*)" "(?P<user_agent>[^"]*)"' )
+      if err != null {
+        log("Error parsing regex: " + to_string(err), level: "error")
+        log("Message content: " + to_string(.message), level: "error")
+        .message = ""
+      }
+      # 필드 매핑/형변환
+      .x_forwarded_for = this_is_a_test.xff
+      .remote_host = this_is_a_test.remote_host
+      .identd = this_is_a_test.identd
+      .user = this_is_a_test.user
+      .origin_time = parse_timestamp!(this_is_a_test.timestamp, format: "%d/%b/%Y:%H:%M:%S %z")
+      .method = this_is_a_test.method
+      .uri = this_is_a_test.uri
+      .protocol = this_is_a_test.protocol
+
+      # 숫자형 필드 보정('-' → 0)
+      if this_is_a_test.status == "-" {
+        log("status가 null입니다. 0으로 설정합니다.")
+        this_is_a_test.status = "0"
+      } else {
+        this_is_a_test.status = to_int!(this_is_a_test.status)
+      }
+      if this_is_a_test.bytes == "-" {
+        log("bytes가 null입니다. 0으로 설정합니다.")
+        this_is_a_test.bytes = "0"
+      } else {
+        this_is_a_test.bytes = to_int!(this_is_a_test.bytes)
+      }
+      if this_is_a_test.duration == "-" {
+        log("duration이 null입니다. 0으로 설정합니다.")
+        this_is_a_test.duration = "0"
+      } else {
+        this_is_a_test.duration = to_int!(this_is_a_test.duration)
+      }
+
+      .status = this_is_a_test.status
+      .bytes = this_is_a_test.bytes
+      .duration = this_is_a_test.duration
+      .referer = this_is_a_test.referer
+      .user_agent = this_is_a_test.user_agent
+
+      # URL 파싱 (path/query 분리)
+      request_param = parse_url!(join!(["ftp://foo@example.com:4343", .uri]))
+      .path_uri        = to_string(request_param.path)
+      log("ads 로그 파싱 완료") 
+
+      # 쿼리 일반 파라미터 (키 변형 대응)
+      if exists(request_param.query.tp) {
+        .target_platform = request_param.query.tp
+      } else {
+        .target_platform = request_param.query.target_platform
+      }
+      if exists(request_param.query.channelname) {
+        .channel_name = request_param.query.channelname
+      } else {
+        .channel_name = request_param.query.channel_name
+      }
+      if exists(request_param.query.channelid) {
+        .channel_id = request_param.query.channelid
+      } else {
+        .channel_id = request_param.query.channel_id
+      }
+
+      # program_id ↔ programId 호환
+      if exists(request_param.query.program_id) {
+        .program_id = request_param.query.program_id
+      } else {
+        .program_id = request_param.query.programId
+      }
+      .apikey          = request_param.query.apikey
+      .auth            = request_param.query.auth
+      .live_type       = request_param.query.live_type
+
+      # 채널 그룹핑 (50단위 버킷, rt 접두 분리)
+      .channel_group = "default_group"
+      if !is_nullish(.channel_id) {
+        m, err = parse_regex(.channel_id, r'^newid_(?P<prefix>rt)?(?P<num>\d{1,4})(?:_.*)?$')
+        if err == null {
+          num      = to_int!(m.num)
+          bucket   = to_string(floor(num / 50))
+          if m.prefix == "rt" {
+            .channel_group ="grp_rt_" + bucket
+          } else {
+            .channel_group = "grp_" + bucket
+          } 
+        } else {
+          log("Regex parsing error: " + to_string(err) + " for channel_id: " + to_string(.channel_id))
+        }
+        log("live 0_101 그룹화 완료 for channel_id: " + to_string(.channel_id) + ", group: " + to_string(.channel_group))
+      }
+      log("ads 그룹화 완료")
+
+      # ads.* 네임스페이스 파라미터 일괄 추출 (존재 시)
+      .ads_live        = request_param.query."ads.live"
+      .ads_deviceid    = request_param.query."ads.deviceid"
+      .ads_ifa         = request_param.query."ads.ifa"
+      .ads_ifatype     = request_param.query."ads.ifatype"
+      .ads_lat         = request_param.query."ads.lat"
+      .ads_donotsell   = request_param.query."ads.donotsell"
+      .ads_ua          = request_param.query."ads.ua"
+      .ads_ip          = request_param.query."ads.ip"
+      .ads_gdpr        = request_param.query."ads.gdpr"
+      .ads_gdpr_consent = request_param.query."ads.gdpr_consent"
+      .ads_country     = request_param.query."ads.country"
+      .ads_us_privacy  = request_param.query."ads.us_privacy"
+      .ads_appstoreurl = request_param.query."ads.appstoreurl"
+      .ads_bundleid    = request_param.query."ads.bundleid"
+      .ads_appname     = request_param.query."ads.appname"
+      .ads_appversion  = request_param.query."ads.appversion"
+      .ads_devicetype  = request_param.query."ads.devicetype"
+      .ads_devicemake  = request_param.query."ads.devicemake"
+      .ads_devicemodel = request_param.query."ads.devicemodel"
+      .ads_targetad    = request_param.query."ads.targetad"
+      .ads_fck         = request_param.query."ads.fck"
+      .ads_viewsize    = request_param.query."ads.viewsize"
+
+      # 호스트 식별자 (라벨 host로 전달)
+      .host_id = "ads-0-25"
+      del(.message)
+
+      log("ads 로그 완료" + to_string(.origin_time))
+      .timestamp = .origin_time
+
+  # ---------------------------------------------------------
+  # LIVE 파서 (Apache 포맷, master/sub 분기)
+  # - XFF 첫 IP 추출(final_host는 에러시 빈 문자열)
+  # - channel_id 없으면 path에서 channel_id/target_platform 보정
+  # - host_id로 노드 식별
+  # ---------------------------------------------------------
+  Live:
+    type: remap
+    inputs: 
+      - route_by_service.Live 
+    source: |
+      log("live 0_101 로그 시작")
+      .message, err = replace(.message, "\0", "")
+      if err != null {
+        log("Error replacing null characters: " + to_string(err))
+        log("Message content: " + to_string(.message), level: "error")
+        .message = ""
+      }
+
+      # tar 헤더 흔적 제거
+      if contains(.message, "ustar") {
+          .message = replace(.message, "ustar", "")
+      }
+      if contains(.message, "root") {
+          .message = replace(.message, "root", "")
+      }
+
+      # Apache + duration 파싱
+      this_is_a_test, err = parse_regex( .message, r'^(?P<xff>[^ ]+(?:, ?[^ ]+)*) (?P<remote_host>[^ ]+) (?P<identd>[^ ]+) (?P<user>[^ ]+) \[(?P<timestamp>[^\]]+)\] "(?P<method>[A-Z]+) (?P<uri>[^ ]+) (?P<protocol>[^"]+)" (?P<status>\d{3}) (?P<bytes>[^ ]+) (?P<duration>[^ ]+) "(?P<referer>[^"]*)" "(?P<user_agent>[^"]*)"' )
+      if err != null {
+        log("Error parsing regex: " + to_string(err), level: "error")
+        log("Message content: " + to_string(.message), level: "error")
+        .message = ""
+      }
+      .x_forwarded_for = this_is_a_test.xff
+
+      # XFF 첫 IP만 추출
+      .final_host ,err = parse_regex(.x_forwarded_for, r'^(?P<host>[^, ]+)(?:,|$)').host
+      if err != null {
+        log("Error parsing x_forwarded_for: " + to_string(err), level: "error")
+        .x_forwarded_for = ""
+      }
+
+      # 필드 매핑/형변환
+      .remote_host = this_is_a_test.remote_host
+      .identd = this_is_a_test.identd
+      .user = this_is_a_test.user
+      .origin_time = parse_timestamp!(this_is_a_test.timestamp, format: "%d/%b/%Y:%H:%M:%S %z")
+      .method = this_is_a_test.method
+      .uri = this_is_a_test.uri
+      .protocol = this_is_a_test.protocol
+      if this_is_a_test.status == "-" { this_is_a_test.status = "0" } else { this_is_a_test.status = to_int!(this_is_a_test.status) }
+      if this_is_a_test.bytes == "-"  { this_is_a_test.bytes  = "0" } else { this_is_a_test.bytes  = to_int!(this_is_a_test.bytes)  }
+      if this_is_a_test.duration == "-" { this_is_a_test.duration = "0" } else { this_is_a_test.duration = to_int!(this_is_a_test.duration) }
+
+      .status = this_is_a_test.status
+      .bytes = this_is_a_test.bytes
+      .duration = this_is_a_test.duration
+      .referer = this_is_a_test.referer
+      .user_agent = this_is_a_test.user_agent
+
+      # URL 파싱
+      request_param = parse_url!(join!(["ftp://foo@example.com:4343", .uri]))
+      .path_uri        = to_string(request_param.path)
+      log("live 0_101 로그 파싱 완료")
+
+      # query 키 변형 대응
+      if exists(request_param.query.targetplatform) { .target_platform = request_param.query.targetplatform } else { .target_platform = request_param.query.target_platform }
+      if exists(request_param.query.channelname) { .channel_name = request_param.query.channelname } else { .channel_name = request_param.query.channel_name }
+      if exists(request_param.query.channelid) { .channel_id = request_param.query.channelid } else { .channel_id = request_param.query.channel_id }
+      if exists(request_param.query.fail_count) { .fail_count = request_param.query.fail_count } else { .fail_count = request_param.query.fail_count }
+      if exists(request_param.query.fail_host ) { .fail_host  = request_param.query.fail_host  } else { .fail_count = request_param.query.fail_host  }
+
+      if exists(request_param.query.program_id) { .program_id = request_param.query.program_id } else { .program_id = request_param.query.programId }
+
+      .resolution = "default"
+      .apikey          = request_param.query.apikey
+      .resolution      = request_param.query.resolution
+      .auth           = request_param.query.auth
+
+      # channel_id 없으면 master(minifest)로 간주하고 path로 보정
+      log("live 0_101 url 파싱 완료")
+      if is_nullish(.channel_id) {
+        .minifest = "master"
+        url_group, err = parse_regex(.path_uri, r'^(?:/)?[^/]+/(?P<seg2>[^/]+)/(?P<seg3>[^/]+)')
+        if err != null {
+          log("Error parsing path_uri: " + to_string(err))
+          .path_uri = ""
+        } else {
+          .channel_id = url_group.seg2
+          .target_platform = url_group.seg3
+          log("live 0_101 minifest 설정 완료: " + to_string(.channel_id) + ", " + to_string(.target_platform))
+        }
+      } else {
+        .minifest = "sub"
+      }
+
+      # 그룹핑
+      .channel_group = "default_group"
+      if !is_nullish(.channel_id) {
+        m, err = parse_regex(.channel_id, r'^newid_(?P<prefix>rt)?(?P<num>\d{1,4})(?:_.*)?$')
+        if err == null {
+          num = to_int!(m.num); bucket = to_string(floor(num / 50))
+          if m.prefix == "rt" { .channel_group ="grp_rt_" + bucket } else { .channel_group = "grp_" + bucket }
+        } else {
+          log("Regex parsing error: " + to_string(err) + " for channel_id: " + to_string(.channel_id))
+        }
+        log("live 0_101 그룹화 완료 for channel_id: " + to_string(.channel_id) + ", group: " + to_string(.channel_group))
+      }
+
+      log("live 0_101 로그 완료" + to_string(.origin_time))
+      .timestamp = .origin_time
+
+      del(.message)  # 원본 메시지 제거
+
+
+  # ---------------------------------------------------------
+# # Live: 0_102
+#   parse_aparche_live_us_0_101:
+#     type: remap
+#     inputs: 
+#       - us_live_files_0_101
+#     source: |
+#       log("live 0_102 로그 시작")
+
+#       # NUL 제거
+#       .message, err = replace(.message, "\0", "")
+#       if err != null {
+#         log("Error replacing null characters: " + to_string(err))
+#         .message = ""
+#       }
+
+#       # tar 헤더 흔적 제거
+#       if contains(.message, "ustar") {
+#           .message = replace(.message, "ustar", "")
+#       }
+#       if contains(.message, "root") {
+#           .message = replace(.message, "root", "")
+#       }
+
+#       # Apache + duration 파싱
+#       this_is_a_test, err = parse_regex( .message, r'^(?P<xff>[^ ]+(?:, ?[^ ]+)*) (?P<remote_host>[^ ]+) (?P<identd>[^ ]+) (?P<user>[^ ]+) \[(?P<timestamp>[^\]]+)\] "(?P<method>[A-Z]+) (?P<uri>[^ ]+) (?P<protocol>[^"]+)" (?P<status>\d{3}) (?P<bytes>[^ ]+) (?P<time1>[^ ]+) (?P<duration>[^ ]+) "(?P<referer>[^"]*)" "(?P<user_agent>[^"]*)"' )
+#       if err != null {
+#         log("Error parsing regex: " + to_string(err), level: "error")
+#         log("Message content: " + to_string(.message), level: "error")
+#         .message = ""
+#       }
+#       .x_forwarded_for = this_is_a_test.xff
+
+#       # XFF 첫 IP
+#       .final_host ,err = parse_regex(.x_forwarded_for, r'^(?P<host>[^, ]+)(?:,|$)').host
+#       if err != null { log("Error parsing x_forwarded_for: " + to_string(err)); .x_forwarded_for = "" }
+
+#       # 필드 매핑/형변환
+#       .remote_host = this_is_a_test.remote_host
+#       .identd = this_is_a_test.identd
+#       .user = this_is_a_test.user
+#       .origin_time = parse_timestamp!(this_is_a_test.timestamp, format: "%d/%b/%Y:%H:%M:%S %z")
+#       .method = this_is_a_test.method
+#       .uri = this_is_a_test.uri
+#       .protocol = this_is_a_test.protocol
+#       .dontknow = this_is_a_test.time1
+#       if this_is_a_test.status == "-" { this_is_a_test.status = "0" } else { this_is_a_test.status = to_int!(this_is_a_test.status) }
+#       if this_is_a_test.bytes == "-"  { this_is_a_test.bytes  = "0" } else { this_is_a_test.bytes  = to_int!(this_is_a_test.bytes)  }
+#       if this_is_a_test.duration == "-" { this_is_a_test.duration = "0" } else { this_is_a_test.duration = to_int!(this_is_a_test.duration) }
+
+#       .status = this_is_a_test.status
+#       .bytes = this_is_a_test.bytes
+#       .duration = this_is_a_test.duration
+#       .referer = this_is_a_test.referer
+#       .user_agent = this_is_a_test.user_agent
+
+#       # URL 파싱
+#       request_param = parse_url!(join!(["ftp://foo@example.com:4343", .uri]))
+#       .path_uri        = to_string(request_param.path)
+#       log("live 0_102 로그 파싱 완료")
+
+#       # query 키 변형 대응
+#       if exists(request_param.query.targetplatform) { .target_platform = request_param.query.targetplatform } else { .target_platform = request_param.query.target_platform }
+#       if exists(request_param.query.channelname) { .channel_name = request_param.query.channelname } else { .channel_name = request_param.query.channel_name }
+#       if exists(request_param.query.channelid) { .channel_id = request_param.query.channelid } else { .channel_id = request_param.query.channel_id }
+
+#       .resolution = "default"
+#       .apikey          = request_param.query.apikey
+#       .resolution      = request_param.query.resolution
+#       .auth           = request_param.query.auth
+#       if exists(request_param.query.program_id) { .program_id = request_param.query.program_id } else { .program_id = request_param.query.programId }
+
+#       # channel_id 없으면 master로 간주하고 path 보정
+#       if is_nullish(.channel_id) {
+#         .minifest = "master"
+#         url_group, err = parse_regex(.path_uri, r'^(?:/)?[^/]+/(?P<seg2>[^/]+)/(?P<seg3>[^/]+)')
+#         if err != null { log("Error parsing path_uri: " + to_string(err)); .path_uri = "" 
+#         } else {
+#           .channel_id = url_group.seg2
+#           .target_platform = url_group.seg3
+#           log("live 0_101 minifest 설정 완료: " + to_string(.channel_id) + ", " + to_string(.target_platform))
+#         }
+#       } else {
+#         .minifest = "sub"
+#       }
+
+#       # 그룹핑
+#       .channel_group = "default_group"
+#       if !is_nullish(.channel_id) {
+#         m, err = parse_regex(.channel_id, r'^newid_(?P<prefix>rt)?(?P<num>\d{1,4})(?:_.*)?$')
+#         if err == null {
+#           num = to_int!(m.num); bucket = to_string(floor(num / 50))
+#           if m.prefix == "rt" { .channel_group ="grp_rt_" + bucket } else { .channel_group = "grp_" + bucket }
+#         } else { log("Regex parsing error: " + to_string(err) + " for channel_id: " + to_string(.channel_id)) }
+#         log("live 0_101 그룹화 완료 for channel_id: " + to_string(.channel_id) + ", group: " + to_string(.channel_group))
+#       }
+
+#       log("live 0_102 로그 완료" + to_string(.origin_time))
+#       .timestamp = .origin_time
+
+#       del(.message)  # 원본 메시지 삭제
+#       del(.uri)     # 원본 URI 삭제
+
+# # Live: 0_102
+#   parse_aparche_live_us_0_102:
+#     type: remap
+#     inputs: 
+#       - us_live_files_0_102
+#     source: |
+#       log("live 0_102 로그 시작")
+
+#       # NUL 제거
+#       .message, err = replace(.message, "\0", "")
+#       if err != null {
+#         log("Error replacing null characters: " + to_string(err))
+#         .message = ""
+#       }
+
+#       # tar 헤더 흔적 제거
+#       if contains(.message, "ustar") {
+#           .message = replace(.message, "ustar", "")
+#       }
+#       if contains(.message, "root") {
+#           .message = replace(.message, "root", "")
+#       }
+
+#       # Apache + duration 파싱
+#       this_is_a_test, err = parse_regex( .message, r'^(?P<xff>[^ ]+(?:, ?[^ ]+)*) (?P<remote_host>[^ ]+) (?P<identd>[^ ]+) (?P<user>[^ ]+) \[(?P<timestamp>[^\]]+)\] "(?P<method>[A-Z]+) (?P<uri>[^ ]+) (?P<protocol>[^"]+)" (?P<status>\d{3}) (?P<bytes>[^ ]+) (?P<time1>[^ ]+) (?P<duration>[^ ]+) "(?P<referer>[^"]*)" "(?P<user_agent>[^"]*)"' )
+#       if err != null {
+#         log("Error parsing regex: " + to_string(err), level: "error")
+#         log("Message content: " + to_string(.message), level: "error")
+#         .message = ""
+#       }
+#       .x_forwarded_for = this_is_a_test.xff
+
+#       # XFF 첫 IP
+#       .final_host ,err = parse_regex(.x_forwarded_for, r'^(?P<host>[^, ]+)(?:,|$)').host
+#       if err != null { log("Error parsing x_forwarded_for: " + to_string(err)); .x_forwarded_for = "" }
+
+#       # 필드 매핑/형변환
+#       .remote_host = this_is_a_test.remote_host
+#       .identd = this_is_a_test.identd
+#       .user = this_is_a_test.user
+#       .origin_time = parse_timestamp!(this_is_a_test.timestamp, format: "%d/%b/%Y:%H:%M:%S %z")
+#       .method = this_is_a_test.method
+#       .uri = this_is_a_test.uri
+#       .protocol = this_is_a_test.protocol
+#       if this_is_a_test.status == "-" { this_is_a_test.status = "0" } else { this_is_a_test.status = to_int!(this_is_a_test.status) }
+#       if this_is_a_test.bytes == "-"  { this_is_a_test.bytes  = "0" } else { this_is_a_test.bytes  = to_int!(this_is_a_test.bytes)  }
+#       if this_is_a_test.duration == "-" { this_is_a_test.duration = "0" } else { this_is_a_test.duration = to_int!(this_is_a_test.duration) }
+
+#       .status = this_is_a_test.status
+#       .bytes = this_is_a_test.bytes
+#       .duration = this_is_a_test.duration
+#       .referer = this_is_a_test.referer
+#       .user_agent = this_is_a_test.user_agent
+#       .dontknow = this_is_a_test.time1
+
+#       # URL 파싱
+#       request_param = parse_url!(join!(["ftp://foo@example.com:4343", .uri]))
+#       .path_uri        = to_string(request_param.path)
+#       log("live 0_102 로그 파싱 완료")
+
+#       # query 키 변형 대응
+#       if exists(request_param.query.targetplatform) { .target_platform = request_param.query.targetplatform } else { .target_platform = request_param.query.target_platform }
+#       if exists(request_param.query.channelname) { .channel_name = request_param.query.channelname } else { .channel_name = request_param.query.channel_name }
+#       if exists(request_param.query.channelid) { .channel_id = request_param.query.channelid } else { .channel_id = request_param.query.channel_id }
+
+#       .resolution = "default"
+#       .apikey          = request_param.query.apikey
+#       .resolution      = request_param.query.resolution
+#       .auth           = request_param.query.auth
+#       if exists(request_param.query.program_id) { .program_id = request_param.query.program_id } else { .program_id = request_param.query.programId }
+
+#       # channel_id 없으면 master로 간주하고 path 보정
+#       if is_nullish(.channel_id) {
+#         .minifest = "master"
+#         url_group, err = parse_regex(.path_uri, r'^(?:/)?[^/]+/(?P<seg2>[^/]+)/(?P<seg3>[^/]+)')
+#         if err != null { log("Error parsing path_uri: " + to_string(err)); .path_uri = "" 
+#         } else {
+#           .channel_id = url_group.seg2
+#           .target_platform = url_group.seg3
+#           log("live 0_101 minifest 설정 완료: " + to_string(.channel_id) + ", " + to_string(.target_platform))
+#         }
+#       } else {
+#         .minifest = "sub"
+#       }
+
+#       # 그룹핑
+#       .channel_group = "default_group"
+#       if !is_nullish(.channel_id) {
+#         m, err = parse_regex(.channel_id, r'^newid_(?P<prefix>rt)?(?P<num>\d{1,4})(?:_.*)?$')
+#         if err == null {
+#           num = to_int!(m.num); bucket = to_string(floor(num / 50))
+#           if m.prefix == "rt" { .channel_group ="grp_rt_" + bucket } else { .channel_group = "grp_" + bucket }
+#         } else { log("Regex parsing error: " + to_string(err) + " for channel_id: " + to_string(.channel_id)) }
+#         log("live 0_101 그룹화 완료 for channel_id: " + to_string(.channel_id) + ", group: " + to_string(.channel_group))
+#       }
+
+#       # 호스트 식별 라벨용
+#       .host_id = "live-0-102"
+
+#       log("live 0_102 로그 완료" + to_string(.origin_time))
+#       .timestamp = .origin_time
+
+#       del(.message)  # 원본 메시지 삭제
+#       del(.uri)     # 원본 URI 삭제
+# # Live: 0_102
+#   parse_aparche_live_us_10_101:
+#     type: remap
+#     inputs: 
+#       - us_live_files_10_101
+#     source: |
+#       log("live 0_102 로그 시작")
+
+#       # NUL 제거
+#       .message, err = replace(.message, "\0", "")
+#       if err != null {
+#         log("Error replacing null characters: " + to_string(err))
+#         .message = ""
+#       }
+
+#       # tar 헤더 흔적 제거
+#       if contains(.message, "ustar") {
+#           .message = replace(.message, "ustar", "")
+#       }
+#       if contains(.message, "root") {
+#           .message = replace(.message, "root", "")
+#       }
+
+#       # Apache + duration 파싱
+#       this_is_a_test, err = parse_regex( .message, r'^(?P<xff>[^ ]+(?:, ?[^ ]+)*) (?P<remote_host>[^ ]+) (?P<identd>[^ ]+) (?P<user>[^ ]+) \[(?P<timestamp>[^\]]+)\] "(?P<method>[A-Z]+) (?P<uri>[^ ]+) (?P<protocol>[^"]+)" (?P<status>\d{3}) (?P<bytes>[^ ]+) (?P<time1>[^ ]+) (?P<duration>[^ ]+) "(?P<referer>[^"]*)" "(?P<user_agent>[^"]*)"' )
+#       if err != null {
+#         log("Error parsing regex: " + to_string(err), level: "error")
+#         log("Message content: " + to_string(.message), level: "error")
+#         .message = ""
+#       }
+#       .x_forwarded_for = this_is_a_test.xff
+
+#       # XFF 첫 IP
+#       .final_host ,err = parse_regex(.x_forwarded_for, r'^(?P<host>[^, ]+)(?:,|$)').host
+#       if err != null { log("Error parsing x_forwarded_for: " + to_string(err)); .x_forwarded_for = "" }
+
+#       # 필드 매핑/형변환
+#       .remote_host = this_is_a_test.remote_host
+#       .identd = this_is_a_test.identd
+#       .user = this_is_a_test.user
+#       .origin_time = parse_timestamp!(this_is_a_test.timestamp, format: "%d/%b/%Y:%H:%M:%S %z")
+#       .method = this_is_a_test.method
+#       .uri = this_is_a_test.uri
+#       .protocol = this_is_a_test.protocol
+#       if this_is_a_test.status == "-" { this_is_a_test.status = "0" } else { this_is_a_test.status = to_int!(this_is_a_test.status) }
+#       if this_is_a_test.bytes == "-"  { this_is_a_test.bytes  = "0" } else { this_is_a_test.bytes  = to_int!(this_is_a_test.bytes)  }
+#       if this_is_a_test.duration == "-" { this_is_a_test.duration = "0" } else { this_is_a_test.duration = to_int!(this_is_a_test.duration) }
+
+#       .status = this_is_a_test.status
+#       .bytes = this_is_a_test.bytes
+#       .duration = this_is_a_test.duration
+#       .referer = this_is_a_test.referer
+#       .user_agent = this_is_a_test.user_agent
+#       .dontknow = this_is_a_test.time1
+
+#       # URL 파싱
+#       request_param = parse_url!(join!(["ftp://foo@example.com:4343", .uri]))
+#       .path_uri        = to_string(request_param.path)
+#       log("live 0_102 로그 파싱 완료")
+
+#       # query 키 변형 대응
+#       if exists(request_param.query.targetplatform) { .target_platform = request_param.query.targetplatform } else { .target_platform = request_param.query.target_platform }
+#       if exists(request_param.query.channelname) { .channel_name = request_param.query.channelname } else { .channel_name = request_param.query.channel_name }
+#       if exists(request_param.query.channelid) { .channel_id = request_param.query.channelid } else { .channel_id = request_param.query.channel_id }
+
+#       .resolution = "default"
+#       .apikey          = request_param.query.apikey
+#       .resolution      = request_param.query.resolution
+#       .auth           = request_param.query.auth
+#       if exists(request_param.query.program_id) { .program_id = request_param.query.program_id } else { .program_id = request_param.query.programId }
+
+#       # channel_id 없으면 master로 간주하고 path 보정
+#       if is_nullish(.channel_id) {
+#         .minifest = "master"
+#         url_group, err = parse_regex(.path_uri, r'^(?:/)?[^/]+/(?P<seg2>[^/]+)/(?P<seg3>[^/]+)')
+#         if err != null { log("Error parsing path_uri: " + to_string(err)); .path_uri = "" 
+#         } else {
+#           .channel_id = url_group.seg2
+#           .target_platform = url_group.seg3
+#           log("live 0_101 minifest 설정 완료: " + to_string(.channel_id) + ", " + to_string(.target_platform))
+#         }
+#       } else {
+#         .minifest = "sub"
+#       }
+
+#       # 그룹핑
+#       .channel_group = "default_group"
+#       if !is_nullish(.channel_id) {
+#         m, err = parse_regex(.channel_id, r'^newid_(?P<prefix>rt)?(?P<num>\d{1,4})(?:_.*)?$')
+#         if err == null {
+#           num = to_int!(m.num); bucket = to_string(floor(num / 50))
+#           if m.prefix == "rt" { .channel_group ="grp_rt_" + bucket } else { .channel_group = "grp_" + bucket }
+#         } else { log("Regex parsing error: " + to_string(err) + " for channel_id: " + to_string(.channel_id)) }
+#         log("live 0_101 그룹화 완료 for channel_id: " + to_string(.channel_id) + ", group: " + to_string(.channel_group))
+#       }
+
+#       # 호스트 식별 라벨용
+#       .host_id = "live-10-101"
+
+#       log("live 10_101 로그 완료" + to_string(.origin_time))
+#       .timestamp = .origin_time
+
+#       del(.message)  # 원본 메시지 삭제
+#       del(.uri)     # 원본 URI 삭제
+
+# # Live: 0_102
+#   parse_aparche_live_us_10_102:
+#     type: remap
+#     inputs: 
+#       - us_live_files_10_102
+#     source: |
+#       log("live 10_102 로그 시작")
+
+#       # NUL 제거
+#       .message, err = replace(.message, "\0", "")
+#       if err != null {
+#         log("Error replacing null characters: " + to_string(err))
+#         .message = ""
+#       }
+
+#       # tar 헤더 흔적 제거
+#       if contains(.message, "ustar") {
+#           .message = replace(.message, "ustar", "")
+#       }
+#       if contains(.message, "root") {
+#           .message = replace(.message, "root", "")
+#       }
+
+#       # Apache + duration 파싱
+#       this_is_a_test, err = parse_regex( .message, r'^(?P<xff>[^ ]+(?:, ?[^ ]+)*) (?P<remote_host>[^ ]+) (?P<identd>[^ ]+) (?P<user>[^ ]+) \[(?P<timestamp>[^\]]+)\] "(?P<method>[A-Z]+) (?P<uri>[^ ]+) (?P<protocol>[^"]+)" (?P<status>\d{3}) (?P<bytes>[^ ]+) (?P<time1>[^ ]+) (?P<duration>[^ ]+) "(?P<referer>[^"]*)" "(?P<user_agent>[^"]*)"' )
+#       if err != null {
+#         log("Error parsing regex: " + to_string(err), level: "error")
+#         log("Message content: " + to_string(.message), level: "error")
+#         .message = ""
+#       }
+#       .x_forwarded_for = this_is_a_test.xff
+
+#       # XFF 첫 IP
+#       .final_host ,err = parse_regex(.x_forwarded_for, r'^(?P<host>[^, ]+)(?:,|$)').host
+#       if err != null { log("Error parsing x_forwarded_for: " + to_string(err)); .x_forwarded_for = "" }
+
+#       # 필드 매핑/형변환
+#       .remote_host = this_is_a_test.remote_host
+#       .identd = this_is_a_test.identd
+#       .user = this_is_a_test.user
+#       .origin_time = parse_timestamp!(this_is_a_test.timestamp, format: "%d/%b/%Y:%H:%M:%S %z")
+#       .method = this_is_a_test.method
+#       .uri = this_is_a_test.uri
+#       .protocol = this_is_a_test.protocol
+#       if this_is_a_test.status == "-" { this_is_a_test.status = "0" } else { this_is_a_test.status = to_int!(this_is_a_test.status) }
+#       if this_is_a_test.bytes == "-"  { this_is_a_test.bytes  = "0" } else { this_is_a_test.bytes  = to_int!(this_is_a_test.bytes)  }
+#       if this_is_a_test.duration == "-" { this_is_a_test.duration = "0" } else { this_is_a_test.duration = to_int!(this_is_a_test.duration) }
+
+#       .status = this_is_a_test.status
+#       .bytes = this_is_a_test.bytes
+#       .duration = this_is_a_test.duration
+#       .referer = this_is_a_test.referer
+#       .user_agent = this_is_a_test.user_agent
+#       .dontknow = this_is_a_test.time1
+
+#       # URL 파싱
+#       request_param = parse_url!(join!(["ftp://foo@example.com:4343", .uri]))
+#       .path_uri        = to_string(request_param.path)
+#       log("live 0_102 로그 파싱 완료")
+
+#       # query 키 변형 대응
+#       if exists(request_param.query.targetplatform) { .target_platform = request_param.query.targetplatform } else { .target_platform = request_param.query.target_platform }
+#       if exists(request_param.query.channelname) { .channel_name = request_param.query.channelname } else { .channel_name = request_param.query.channel_name }
+#       if exists(request_param.query.channelid) { .channel_id = request_param.query.channelid } else { .channel_id = request_param.query.channel_id }
+
+#       .resolution = "default"
+#       .apikey          = request_param.query.apikey
+#       .resolution      = request_param.query.resolution
+#       .auth           = request_param.query.auth
+#       if exists(request_param.query.program_id) { .program_id = request_param.query.program_id } else { .program_id = request_param.query.programId }
+
+#       # channel_id 없으면 master로 간주하고 path 보정
+#       if is_nullish(.channel_id) {
+#         .minifest = "master"
+#         url_group, err = parse_regex(.path_uri, r'^(?:/)?[^/]+/(?P<seg2>[^/]+)/(?P<seg3>[^/]+)')
+#         if err != null { log("Error parsing path_uri: " + to_string(err)); .path_uri = "" 
+#         } else {
+#           .channel_id = url_group.seg2
+#           .target_platform = url_group.seg3
+#           log("live 0_101 minifest 설정 완료: " + to_string(.channel_id) + ", " + to_string(.target_platform))
+#         }
+#       } else {
+#         .minifest = "sub"
+#       }
+
+#       # 그룹핑
+#       .channel_group = "default_group"
+#       if !is_nullish(.channel_id) {
+#         m, err = parse_regex(.channel_id, r'^newid_(?P<prefix>rt)?(?P<num>\d{1,4})(?:_.*)?$')
+#         if err == null {
+#           num = to_int!(m.num); bucket = to_string(floor(num / 50))
+#           if m.prefix == "rt" { .channel_group ="grp_rt_" + bucket } else { .channel_group = "grp_" + bucket }
+#         } else { log("Regex parsing error: " + to_string(err) + " for channel_id: " + to_string(.channel_id)) }
+#         log("live 0_101 그룹화 완료 for channel_id: " + to_string(.channel_id) + ", group: " + to_string(.channel_group))
+#       }
+
+#       # 호스트 식별 라벨용
+#       .host_id = "live-10-102"
+
+#       log("live 10_102 로그 완료" + to_string(.origin_time))
+#       .timestamp = .origin_time
+
+#       del(.message)  # 원본 메시지 삭제
+#       del(.uri)     # 원본 URI 삭제
+
+
+# =====================================
+# 📤 SINKS: Loki 전송 설정
+# =====================================
+sinks:
+  # Tencent CDN → Loki
+  loki_tencent:
+    type: loki
+    inputs: [Tencent_cdn]
+    endpoint: "http://loki:3100"
+    encoding:
+      codec: json
+    labels:
+      job: "Tencent_cdn"
+      host: "{{ cdn_host }}"
+      status_code: "{{ status_code }}"
+      cache_hit: "{{ cache_hit }}"
+      platform: "{{ target_platform }}"
+      resolution: "{{ resolution }}"
+      channel_group: "{{ channel_group }}"
+    out_of_order_action: "accept"
+
+  # CloudFront CDN → Loki
+  loki_cf:
+    type: loki
+    inputs: [CloudFront_cdn]
+    endpoint: "http://loki:3100"
+    encoding:
+      codec: json
+    labels:
+      job: "CloudFront_cdn"
+      host: "{{ cdn_host }}"
+      status_code: "{{ status_code }}"
+      cache_hit: "{{ cache_hit }}"
+      platform: "{{ target_platform }}"
+      resolution: "{{ resolution }}"
+      channel_group: "{{ channel_group }}"
+    out_of_order_action: "accept"
+
+  # Ads → Loki
+  apache_logs_ads:
+    type: loki
+    inputs: [Ads]
+    endpoint: "http://loki:3100"
+    encoding:
+      codec: json
+    labels:
+      job: "Ads"
+      host: "{{ host_id }}"
+      target_platform: "{{ target_platform }}"
+      status_code: "{{ status }}"
+      channel_group: "{{ channel_group }}"
+    out_of_order_action: "accept"
+
+  # Live → Loki
+  apache_logs_live:
+    type: loki
+    inputs: [Live]
+    endpoint: "http://loki:3100"
+    encoding:
+      codec: json
+    labels:
+      job: "Live"
+      region: "KR"
+      host: "{{ host_id }}"
+      target_platform: "{{ target_platform }}"
+      status_code: "{{ status }}"
+      resolution: "{{ resolution }}"
+      channel_group: "{{ channel_group }}"
+      manifast: "{{ minifest }}"   # 원문 그대로: 라벨 키는 manifast, 값은 minifest 필드
+    out_of_order_action: "accept"
+
+  Unknown:
+    type: loki
+    inputs: [route_by_service.Unknown, route_by_service._unmatched]
+    endpoint: "http://loki:3100"
+    encoding:
+      codec: json
+    labels:
+      job: "Unknown"
+    out_of_order_action: "accept"
+
+  # pache_logs_live_us:
+  #   type: loki
+  #   inputs: [parse_aparche_live_us_0_101, parse_aparche_live_us_0_102, parse_aparche_live_us_10_101, parse_aparche_live_us_10_102]
+  #   endpoint: "http://loki:3100"
+  #   encoding:
+  #     codec: json
+  #   labels:
+  #     job: "Live"
+  #     region: "US"
+  #     host: "{{ host_id }}"
+  #     target_platform: "{{ target_platform }}"
+  #     status_code: "{{ status }}"
+  #     resolution: "{{ resolution }}"
+  #     channel_group: "{{ channel_group }}"
+  #     manifast: "{{ minifest }}"   # 원문 그대로: 라벨 키는 manifast, 값은 minifest 필드
+  #   out_of_order_action: "accept"

@@ -1,0 +1,85 @@
+services:
+  loki:
+    image: grafana/loki:3.5.2
+    container_name: loki
+    user: root
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki_tsdb_blocks:/loki/tsdb_blocks
+      - loki_compactor:/loki/compactor
+      - loki_wal:/loki/wal
+      - loki_delete_requests:/loki/delete_requests
+      - loki_index:/loki/index
+      - loki_cache:/loki/cache
+    command: >
+      -config.file=/etc/loki/local-config.yaml
+      -config.expand-env=true
+    # -log.level=warn
+    deploy:
+      resources:
+        limits:
+          memory: 7G
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3100/ready | grep -q ready || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    container_name: grafana
+    depends_on:
+      loki:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-storage:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_LOG_LEVEL=error
+  vector:
+    image: timberio/vector:0.49.0-debian
+    container_name: vector
+    volumes:
+      - ./vector.yaml:/etc/vector/vector.yaml:ro
+      - ./logs:/var/log
+    command: ["--config", "/etc/vector/vector.yaml", "-q"]
+    env_file:
+      - .env
+    environment:
+      - AWS_ACCESS_KEY_ID=${access_key}
+      - AWS_SECRET_ACCESS_KEY=${secret_key}
+    depends_on:
+      loki:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # gemini-cli:
+  #   build: ./gemini-cli
+  #   container_name: gemini-cli
+  #   depends_on:
+  #     loki:
+  #       condition: service_healthy
+  #   volumes:
+  #     - ./gemini-cli/analysis.txt:/app/analysis.txt
+  #     - ./gemini-cli/GEMINI.md:/app/GEMINI.md
+  #   environment:
+  #     - GEMINI_API_KEY=AIzaSyAZDqo4AIr8rPlecNwZHmKea8AQ11Pa0Wo
+
+
+
+volumes:
+  loki_tsdb_blocks:
+  loki_compactor:
+  loki_wal:
+  loki_delete_requests:
+  grafana-storage:
+  loki_cache:
+  loki_index:
