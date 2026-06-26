@@ -71,7 +71,7 @@ services:
   #     - ./gemini-cli/analysis.txt:/app/analysis.txt
   #     - ./gemini-cli/GEMINI.md:/app/GEMINI.md
   #   environment:
-  #     - GEMINI_API_KEY=AIzaSyAZDqo4AIr8rPlecNwZHmKea8AQ11Pa0Wo
+  #     - GEMINI_API_KEY=
 
 
 
